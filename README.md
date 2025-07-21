@@ -23,17 +23,17 @@ This bot uses Docker. If you need to know how to install and set up Docker refer
 > [!IMPORTANT]
 > This Guide is for running the bot using Docker. If you wish to run the bot any other way, you are on your own.
 
-1. Down the Source Code
+1. Download the Source Code
 
-   > ` git clone https://github.com/giralal/Reaction-Cleaner-Bot`
+   > `git clone https://github.com/giralal/Reaction-Cleaner-Bot`
 
 2. Navigate to the bot's directory
 
-   > ` cd Reaction-Cleaner-Bot`
+   > `cd Reaction-Cleaner-Bot`
 
 3. Make a copy of .envexample simply as .env
 
-   > ` cp .envexample .env`
+   > `cp .envexample .env`
 
 4. Fill in .env
 
@@ -48,5 +48,6 @@ This bot uses Docker. If you need to know how to install and set up Docker refer
 
 > If you need to stop the bot
 > `docker compose down`
+
 > To start it without rebuilding
-> ` docker compose up -d`
+> `docker compose up -d`
