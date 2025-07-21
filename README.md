@@ -14,7 +14,7 @@ Do you have a niche scenario and need a bot to remove reactions from a certain m
 
 > `disable-all-cleaning` - stops all reaction cleaning
 
--# more commands may come but this should be most of the needed functionality already
+More commands may come but this should be most of the needed functionality already
 
 ## Installation
 
@@ -44,7 +44,7 @@ This bot uses Docker. If you need to know how to install and set up Docker refer
 > `docker compose up -d --build`
 > you will need to run this everytime you edit the source code for your changes to update
 
-5.1 Stopping the bot
+## Stopping the bot
 
 > If you need to stop the bot
 > `docker compose down`
