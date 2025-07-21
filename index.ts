@@ -22,7 +22,7 @@ function ensureDataDirectoryAndDatabase(dataDir: string, dbPath: string): void {
   if (!existsSync(dataDir)) {
     console.log(`📁 Data directory doesn't exist. Creating: ${dataDir}`);
     try {
-      mkdirSync(dataDir, { recursive: true, mode: 0o755 });
+      mkdirSync(dataDir, { recursive: true, mode: 0o775 });
       console.log('✅ Data directory created successfully');
     } catch (error) {
       console.error('❌ Failed to create data directory:', error);
@@ -32,11 +32,46 @@ function ensureDataDirectoryAndDatabase(dataDir: string, dbPath: string): void {
     console.log('✅ Data directory already exists');
   }
   
-  // Check database file (SQLite will create it automatically if it doesn't exist)
+  // Test write permissions by creating a test file
+  const testFile = path.join(dataDir, 'test-write-permissions.tmp');
+  try {
+    const fs = require('fs');
+    fs.writeFileSync(testFile, 'test');
+    fs.unlinkSync(testFile);
+    console.log('✅ Write permissions verified for data directory');
+  } catch (writeError) {
+    console.error('❌ No write permissions to data directory:', writeError);
+    console.error('Directory stats:', require('fs').statSync(dataDir));
+    console.error('Process UID:', process.getuid?.() || 'unknown');
+    console.error('Process GID:', process.getgid?.() || 'unknown');
+    throw new Error(`Cannot write to data directory: ${dataDir}`);
+  }
+  
+  // Check database file
   if (!existsSync(dbPath)) {
     console.log(`🗄️ Database file doesn't exist. It will be created: ${dbPath}`);
+    // Try to pre-create the database file with proper permissions
+    try {
+      const fs = require('fs');
+      fs.writeFileSync(dbPath, '', { mode: 0o664 });
+      console.log('✅ Database file pre-created successfully');
+    } catch (createError) {
+      console.warn('⚠️ Could not pre-create database file (SQLite will try):', createError);
+    }
   } else {
     console.log('✅ Database file already exists');
+    try {
+      const fs = require('fs');
+      const stats = fs.statSync(dbPath);
+      console.log('Database file stats:', {
+        size: stats.size,
+        mode: '0' + (stats.mode & parseInt('777', 8)).toString(8),
+        uid: stats.uid,
+        gid: stats.gid
+      });
+    } catch (statError) {
+      console.warn('⚠️ Could not get database file stats:', statError);
+    }
   }
 }
 
@@ -212,6 +247,16 @@ const commands = [
     .setName("ping")
     .setDescription("Check if the bot is responsive.")
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName("source-code")
+    .setDescription("Get the source code repository link for this bot.")
+    .addBooleanOption((option) =>
+      option
+        .setName("ephemeral")
+        .setDescription("Whether to show the response only to you (default: true)")
+        .setRequired(false)
+    )
+    .toJSON(),
 ];
 
 // Register slash commands function
@@ -252,9 +297,9 @@ client.once("ready", async () => {
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  const ephemeralReply = (content: string): InteractionReplyOptions => ({
+  const ephemeralReply = (content: string, ephemeral: boolean = true): InteractionReplyOptions => ({
     content,
-    ephemeral: true,
+    ephemeral,
   });
 
   try {
@@ -433,6 +478,11 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.editReply({
         content: `🏓 Pong! Latency: ${end - start}ms | WebSocket: ${Math.round(client.ws.ping)}ms`
       });
+    }
+
+    else if (interaction.commandName === "source-code") {
+      const isEphemeral = interaction.options.getBoolean("ephemeral") ?? true; // Default to true if not specified
+      await interaction.reply(ephemeralReply("The source code for this bot can be found [here](<https://github.com/giralal/Reaction-Cleaner-Bot>)", isEphemeral));
     }
 
   } catch (error) {
