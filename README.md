@@ -18,7 +18,7 @@ More commands may come but this should be most of the needed functionality alrea
 
 ## Installation
 
-This bot uses Docker. If you need to know how to install and set up Docker refer to the [Docker Docs](https://docs.docker.com/engine/install/) I also recommend not running docker as a non root user which you can find instructions for [here](https://docs.docker.com/engine/install/linux-postinstall/)
+This bot uses Docker. If you need to know how to install and set up Docker refer to the [Docker Docs](https://docs.docker.com/engine/install/) I also recommend running docker as a non root user which you can find instructions for [here](https://docs.docker.com/engine/install/linux-postinstall/)
 
 > [!IMPORTANT]
 > This Guide is for running the bot using Docker. If you wish to run the bot any other way, you are on your own.
