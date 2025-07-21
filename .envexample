@@ -1,0 +1,8 @@
+# Discord Bot Token - Get from Discord Developer Portal
+DISCORD_TOKEN=your_discord_bot_token_here
+
+# Discord Application Client ID - Get from Discord Developer Portal
+CLIENT_ID=your_client_id_here
+
+# Discord Server IDs (comma-separated if multiple)
+GUILD_IDS=guildid1,guildid2,etc

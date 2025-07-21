@@ -1,0 +1,23 @@
+name: giral-reaction-cleaner-bot
+services:
+  reaction-cleaner-discord-bot:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: giral-reaction-cleaner-bot
+    restart: unless-stopped
+   
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - CLIENT_ID=${CLIENT_ID}
+      - GUILD_IDS=${GUILD_IDS}
+      - NODE_ENV=production
+   
+    volumes:
+      - ./.data:/app/.data  
+     
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
