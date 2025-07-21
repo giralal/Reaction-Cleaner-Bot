@@ -7,8 +7,10 @@ import {
   Routes,
   SlashCommandBuilder,
   TextChannel,
+  ThreadChannel,
   Message,
   InteractionReplyOptions,
+  ChannelType,
 } from "discord.js";
 import Database from "better-sqlite3";
 import { existsSync, mkdirSync, } from "fs";
@@ -79,13 +81,7 @@ function ensureDataDirectoryAndDatabase(dataDir: string, dbPath: string): void {
 const dataDir = path.join(process.cwd(), '.data');
 const dbPath = path.join(dataDir, 'reaction_cleaner.db');
 
-
-
 console.log(`📄 Initializing SQLite at: ${dbPath}`); // Will throw if path is invalid
-
-
-
-
 console.log('Current working directory:', process.cwd());
 console.log('Data directory path:', dataDir);
 console.log('Database file path:', dbPath);
@@ -98,7 +94,6 @@ console.log('Database file exists:', existsSync(dbPath));
 
 // Initialize SQLite database (this will create the file if it doesn't exist)
 let db: Database.Database;
-
 try {
   db = new Database(dbPath, {
     verbose: process.env.NODE_ENV === 'development' ? console.log : undefined
@@ -125,6 +120,25 @@ try {
   process.exit(1);
 }
 
+// Define the database row type
+interface TrackedMessage {
+  message_url: string;
+  channel_id: string;
+  message_id: string;
+  added_at: string;
+}
+
+// Define type for count query result
+interface CountResult {
+  count: number;
+}
+
+// Define type for database operation results - this was the main issue
+interface DatabaseRunResult {
+  changes: number;
+  lastInsertRowid: number | bigint;
+}
+
 // Prepared statements for better performance
 const insertMessage = db.prepare("INSERT OR IGNORE INTO tracked_messages (message_url, channel_id, message_id) VALUES (?, ?, ?)");
 const deleteMessage = db.prepare("DELETE FROM tracked_messages WHERE message_url = ?");
@@ -134,7 +148,7 @@ const clearAllMessages = db.prepare("DELETE FROM tracked_messages");
 // Test database connection and log initial state
 console.log("🧪 Testing database connection...");
 try {
-  const testQuery = db.prepare("SELECT COUNT(*) as count FROM tracked_messages").get() as { count: number };
+  const testQuery = db.prepare("SELECT COUNT(*) as count FROM tracked_messages").get() as CountResult;
   console.log(`✅ Database connection successful. Current messages in DB: ${testQuery.count}`);
 } catch (error) {
   console.error("❌ Database connection test failed:", error);
@@ -153,36 +167,94 @@ const client = new Client({
 // Store cleaning intervals by message URL
 const cleaningTasks: Record<string, NodeJS.Timeout> = {};
 
-// Function to start cleaning a message
+// Enhanced function to parse Discord message URLs (supports threads and forum posts)
+function parseMessageUrl(messageUrl: string): { channelId: string; messageId: string } | null {
+  try {
+    // Discord message URL patterns:
+    // Regular channel: https://discord.com/channels/GUILD_ID/CHANNEL_ID/MESSAGE_ID
+    // Thread: https://discord.com/channels/GUILD_ID/CHANNEL_ID/MESSAGE_ID (same format)
+    // The channel_id in threads is the thread ID, not the parent channel ID
+    
+    const url = new URL(messageUrl);
+    const pathParts = url.pathname.split('/').filter(part => part.length > 0);
+    
+    // Expected format: ['channels', 'GUILD_ID', 'CHANNEL_ID', 'MESSAGE_ID']
+    if (pathParts.length >= 4 && pathParts[0] === 'channels') {
+      const channelId = pathParts[2]; // This will be thread ID for threads, channel ID for regular channels
+      const messageId = pathParts[3];
+      
+      if (channelId && messageId) {
+        return { channelId, messageId };
+      }
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('Error parsing message URL:', error);
+    return null;
+  }
+}
+
+// Enhanced function to start cleaning a message (supports all channel types)
 async function startCleaning(messageUrl: string, channelId: string, messageId: string): Promise<{ success: boolean; error?: string; message?: Message }> {
   try {
+    // Fetch the channel - this works for regular channels, threads, and forum posts
     const channel = await client.channels.fetch(channelId);
-    if (!channel || !(channel instanceof TextChannel)) {
-      return { success: false, error: "Channel not found or is not a text channel" };
+    
+    if (!channel) {
+      return { success: false, error: "Channel not found" };
     }
 
+    // Check if it's a supported channel type
+    let targetChannel: TextChannel | ThreadChannel;
+    
+    if (channel.type === ChannelType.GuildText || 
+        channel.type === ChannelType.GuildAnnouncement ||
+        channel.type === ChannelType.GuildVoice) {
+      targetChannel = channel as TextChannel;
+    } else if (channel.type === ChannelType.PublicThread || 
+               channel.type === ChannelType.PrivateThread ||
+               channel.type === ChannelType.AnnouncementThread) {
+      targetChannel = channel as ThreadChannel;
+    } else if (channel.type === ChannelType.GuildForum) {
+      // For forum channels, the channelId should actually be a thread ID
+      return { success: false, error: "Forum channel detected - please use the specific thread URL, not the forum channel URL" };
+    } else {
+      return { success: false, error: `Unsupported channel type: ${channel.type}` };
+    }
+
+    // Try to fetch the message
     let message: Message;
     try {
-      message = await channel.messages.fetch(messageId);
-    } catch {
-      return { success: false, error: "Message not found" };
+      message = await targetChannel.messages.fetch(messageId);
+    } catch (fetchError) {
+      console.error(`Failed to fetch message ${messageId} from channel ${channelId}:`, fetchError);
+      return { success: false, error: "Message not found or bot lacks permission to access it" };
     }
 
+    // Check if already cleaning
     if (cleaningTasks[messageUrl]) {
       return { success: false, error: "Already cleaning this message" };
     }
 
+    // Start the cleaning interval
     cleaningTasks[messageUrl] = setInterval(async () => {
       try {
         await message.reactions.removeAll();
-      } catch (e) {
-        console.error("Error clearing reactions:", e);
+        console.log(`🧹 Cleaned reactions for message: ${messageUrl}`);
+      } catch (cleanError) {
+        console.error(`Error clearing reactions for ${messageUrl}:`, cleanError);
+        // If we consistently fail to clean reactions, we might want to stop the task
+        // For now, we'll just log the error and continue trying
       }
     }, 5000);
 
+    console.log(`✅ Started cleaning reactions for: ${messageUrl} (Channel: ${targetChannel.name || 'Unknown'}, Type: ${targetChannel.type})`);
     return { success: true, message };
-  } catch (e) {
-    return { success: false, error: String(e) };
+
+  } catch (error) {
+    console.error(`Error in startCleaning for ${messageUrl}:`, error);
+    return { success: false, error: String(error) };
   }
 }
 
@@ -191,6 +263,7 @@ function stopCleaning(messageUrl: string): boolean {
   if (cleaningTasks[messageUrl]) {
     clearInterval(cleaningTasks[messageUrl]);
     delete cleaningTasks[messageUrl];
+    console.log(`🛑 Stopped cleaning reactions for: ${messageUrl}`);
     return true;
   }
   return false;
@@ -198,16 +271,16 @@ function stopCleaning(messageUrl: string): boolean {
 
 // Function to restore cleaning tasks from database on startup
 async function restoreCleaningTasks() {
-  const trackedMessages = getAllMessages.all() as Array<{ message_url: string; channel_id: string; message_id: string }>;
+  const result = getAllMessages.all() as TrackedMessage[];
   
-  console.log(`🔄 Restoring ${trackedMessages.length} cleaning tasks from database...`);
+  console.log(`🔄 Restoring ${result.length} cleaning tasks from database...`);
   
-  for (const row of trackedMessages) {
-    const result = await startCleaning(row.message_url, row.channel_id, row.message_id);
-    if (result.success) {
+  for (const row of result) {
+    const startResult = await startCleaning(row.message_url, row.channel_id, row.message_id);
+    if (startResult.success) {
       console.log(`✅ Restored cleaning for: ${row.message_url}`);
     } else {
-      console.log(`❌ Failed to restore cleaning for: ${row.message_url} - ${result.error}`);
+      console.log(`❌ Failed to restore cleaning for: ${row.message_url} - ${startResult.error}`);
       // Remove from database if message/channel no longer exists
       deleteMessage.run(row.message_url);
     }
@@ -217,36 +290,41 @@ async function restoreCleaningTasks() {
 const commands = [
   new SlashCommandBuilder()
     .setName("enable-reaction-cleaning")
-    .setDescription("Start continuously removing reactions from messages.")
+    .setDescription("Start continuously removing reactions from messages (supports threads and forum posts).")
     .addStringOption((option) =>
       option
         .setName("message_url")
-        .setDescription("Discord message URLs (space/comma separated)")
+        .setDescription("Discord message URLs (space/comma separated) - works with regular channels, threads, and forum posts")
         .setRequired(true)
     )
     .toJSON(),
+
   new SlashCommandBuilder()
     .setName("disable-reaction-cleaning")
-    .setDescription("Stop cleaning reactions from messages.")
+    .setDescription("Stop cleaning reactions from messages (supports threads and forum posts).")
     .addStringOption((option) =>
       option
         .setName("message_url")
-        .setDescription("Discord message URLs (space/comma separated)")
+        .setDescription("Discord message URLs (space/comma separated) - works with regular channels, threads, and forum posts")
         .setRequired(true)
     )
     .toJSON(),
+
   new SlashCommandBuilder()
     .setName("disable-all-cleaning")
     .setDescription("Stop cleaning reactions from ALL tracked messages.")
     .toJSON(),
+
   new SlashCommandBuilder()
     .setName("list-reaction-cleaning")
     .setDescription("Show all messages currently being cleaned.")
     .toJSON(),
+
   new SlashCommandBuilder()
     .setName("ping")
     .setDescription("Check if the bot is responsive.")
     .toJSON(),
+
   new SlashCommandBuilder()
     .setName("source-code")
     .setDescription("Get the source code repository link for this bot.")
@@ -272,10 +350,10 @@ async function registerCommands() {
       const data = await rest.put(
         Routes.applicationGuildCommands(clientId, guildId),
         { body: commands }
-      ) as any[];
+      ) as unknown[];
       
       console.log(`✅ Successfully reloaded ${data.length} application (/) commands for guild ${guildId}.`);
-      console.log("📋 Registered commands:", data.map(cmd => cmd.name));
+      console.log("📋 Registered commands:", (data as Array<{ name: string }>).map(cmd => cmd.name));
     }
   } catch (error) {
     console.error("❌ Error registering commands:", error);
@@ -305,10 +383,10 @@ client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.commandName === "enable-reaction-cleaning") {
       const messageUrlsRaw = interaction.options.getString("message_url", true);
-
+      
       // Accept multiple URLs separated by space, comma, or newline
       const urls = messageUrlsRaw
-        .split(/[\s,]+/)
+        .split(/[\s,\n]+/)
         .map((u) => u.trim())
         .filter((u) => u.length > 0);
 
@@ -318,32 +396,27 @@ client.on("interactionCreate", async (interaction) => {
       let errors: string[] = [];
 
       for (const messageUrl of urls) {
-        const parts = messageUrl.split("/");
-        if (parts.length < 3) {
+        const parsed = parseMessageUrl(messageUrl);
+        
+        if (!parsed) {
           invalid.push(messageUrl);
           continue;
         }
-        
-        const channelId = parts[parts.length - 2];
-        const messageId = parts[parts.length - 1];
 
+        const { channelId, messageId } = parsed;
         const result = await startCleaning(messageUrl, channelId, messageId);
         
         if (result.success) {
-          if (result.error === "Already cleaning this message") {
-            alreadyRunning.push(messageUrl);
-          } else {
-            // Add to database
-            try {
-              const dbResult = insertMessage.run(messageUrl, channelId, messageId);
-              console.log(`✅ DB Insert successful for ${messageUrl}:`, dbResult);
-              started.push(messageUrl);
-            } catch (dbError) {
-              console.error(`❌ DB Insert failed for ${messageUrl}:`, dbError);
-              errors.push(`${messageUrl}: Database error - ${dbError}`);
-              // Stop cleaning since we couldn't save it
-              stopCleaning(messageUrl);
-            }
+          // Add to database
+          try {
+            const dbResult = insertMessage.run(messageUrl, channelId, messageId) as DatabaseRunResult;
+            console.log(`✅ DB Insert successful for ${messageUrl}:`, dbResult);
+            started.push(messageUrl);
+          } catch (dbError) {
+            console.error(`❌ DB Insert failed for ${messageUrl}:`, dbError);
+            errors.push(`${messageUrl}: Database error - ${dbError}`);
+            // Stop cleaning since we couldn't save it
+            stopCleaning(messageUrl);
           }
         } else {
           if (result.error === "Already cleaning this message") {
@@ -356,25 +429,24 @@ client.on("interactionCreate", async (interaction) => {
 
       let reply = "";
       if (started.length)
-        reply += `Started cleaning reactions for:\n${started.map(url => `• ${url}`).join("\n")}\n\n`;
+        reply += `✅ **Started cleaning reactions for:**\n${started.map(url => `• ${url}`).join("\n")}\n\n`;
       if (alreadyRunning.length)
-        reply += `Already cleaning reactions for:\n${alreadyRunning.map(url => `• ${url}`).join("\n")}\n\n`;
+        reply += `🔄 **Already cleaning reactions for:**\n${alreadyRunning.map(url => `• ${url}`).join("\n")}\n\n`;
       if (invalid.length)
-        reply += `Invalid message URLs:\n${invalid.map(url => `• ${url}`).join("\n")}\n\n`;
+        reply += `❌ **Invalid message URLs:**\n${invalid.map(url => `• ${url}`).join("\n")}\n\n`;
       if (errors.length)
-        reply += `Errors:\n${errors.map(error => `• ${error}`).join("\n")}`;
+        reply += `⚠️ **Errors:**\n${errors.map(error => `• ${error}`).join("\n")}`;
 
       if (!reply) reply = "No valid message URLs provided.";
 
       await interaction.reply(ephemeralReply(reply.trim()));
     }
-
     else if (interaction.commandName === "disable-reaction-cleaning") {
       const messageUrlsRaw = interaction.options.getString("message_url", true);
-
+      
       // Accept multiple URLs separated by space, comma, or newline
       const urls = messageUrlsRaw
-        .split(/[\s,]+/)
+        .split(/[\s,\n]+/)
         .map((u) => u.trim())
         .filter((u) => u.length > 0);
 
@@ -388,8 +460,9 @@ client.on("interactionCreate", async (interaction) => {
       let invalid: string[] = [];
 
       for (const url of urls) {
-        const parts = url.split("/");
-        if (parts.length < 3) {
+        const parsed = parseMessageUrl(url);
+        
+        if (!parsed) {
           invalid.push(url);
           continue;
         }
@@ -397,7 +470,7 @@ client.on("interactionCreate", async (interaction) => {
         if (stopCleaning(url)) {
           // Remove from database
           try {
-            const dbResult = deleteMessage.run(url);
+            const dbResult = deleteMessage.run(url) as DatabaseRunResult;
             console.log(`✅ DB Delete successful for ${url}:`, dbResult);
             stopped.push(url);
           } catch (dbError) {
@@ -411,17 +484,16 @@ client.on("interactionCreate", async (interaction) => {
 
       let reply = "";
       if (stopped.length)
-        reply += `Stopped cleaning reactions for:\n${stopped.map(url => `• ${url}`).join("\n")}\n\n`;
+        reply += `🛑 **Stopped cleaning reactions for:**\n${stopped.map(url => `• ${url}`).join("\n")}\n\n`;
       if (notRunning.length)
-        reply += `No cleaning task was running for:\n${notRunning.map(url => `• ${url}`).join("\n")}\n\n`;
+        reply += `ℹ️ **No cleaning task was running for:**\n${notRunning.map(url => `• ${url}`).join("\n")}\n\n`;
       if (invalid.length)
-        reply += `Invalid message URLs:\n${invalid.map(url => `• ${url}`).join("\n")}`;
+        reply += `❌ **Invalid message URLs:**\n${invalid.map(url => `• ${url}`).join("\n")}`;
 
       if (!reply) reply = "No valid message URLs provided.";
 
       await interaction.reply(ephemeralReply(reply.trim()));
     }
-
     else if (interaction.commandName === "disable-all-cleaning") {
       const activeUrls = Object.keys(cleaningTasks);
       
@@ -437,7 +509,7 @@ client.on("interactionCreate", async (interaction) => {
 
       // Clear all from database
       try {
-        const dbResult = clearAllMessages.run();
+        const dbResult = clearAllMessages.run() as DatabaseRunResult;
         console.log(`✅ DB Clear all successful:`, dbResult);
         await interaction.reply(ephemeralReply(`🛑 Stopped cleaning reactions for all \`${activeUrls.length}\` message(s).`));
       } catch (dbError) {
@@ -445,9 +517,8 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.reply(ephemeralReply(`🛑 Failed to stop cleaning reactions for all \`${activeUrls.length}\` message(s). Warning: Database clear failed.`));
       }
     }
-
     else if (interaction.commandName === "list-reaction-cleaning") {
-      const trackedMessages = getAllMessages.all() as Array<{ message_url: string; added_at: string }>;
+      const trackedMessages = getAllMessages.all() as TrackedMessage[];
       
       if (trackedMessages.length === 0) {
         await interaction.reply(ephemeralReply("No messages are currently being tracked for cleaning."));
@@ -460,16 +531,38 @@ client.on("interactionCreate", async (interaction) => {
       for (const row of trackedMessages) {
         const isActive = cleaningTasks[row.message_url] ? "🟢" : "🔴";
         const addedDate = new Date(row.added_at).toLocaleDateString();
-        reply += `${isActive} ${row.message_url} *(added ${addedDate})*\n`;
+        
+        // Try to identify channel type from URL for better UX
+        let channelInfo = "";
+        const parsed = parseMessageUrl(row.message_url);
+        if (parsed) {
+          try {
+            const channel = await client.channels.fetch(parsed.channelId);
+            if (channel) {
+              const channelTypeEmoji: Record<number, string> = {
+                [ChannelType.GuildText]: "💬",
+                [ChannelType.GuildAnnouncement]: "📢",
+                [ChannelType.PublicThread]: "🧵",
+                [ChannelType.PrivateThread]: "🔒🧵",
+                [ChannelType.AnnouncementThread]: "📢🧵",
+              };
+              
+              channelInfo = ` ${channelTypeEmoji[channel.type] || "❓"}`;
+            }
+          } catch (e) {
+            // Ignore errors fetching channel info for display
+          }
+        }
+        
+        reply += `${isActive}${channelInfo} ${row.message_url} (added ${addedDate})\n`;
       }
 
       if (activeCount !== trackedMessages.length) {
-        reply += `\n*🟢 = Active cleaning | 🔴 = Not running (bot was restarted/error)*`;
+        reply += `\n*🟢 = Active cleaning | 🔴 = Not running*\n*💬 = Text Channel | 📢 = Announcement | 🧵 = Thread | 🔒 = Private*`;
       }
 
       await interaction.reply(ephemeralReply(reply));
     }
-
     else if (interaction.commandName === "ping") {
       const start = Date.now();
       await interaction.reply(ephemeralReply("Pinging..."));
@@ -479,7 +572,6 @@ client.on("interactionCreate", async (interaction) => {
         content: `🏓 Pong! Latency: ${end - start}ms | WebSocket: ${Math.round(client.ws.ping)}ms`
       });
     }
-
     else if (interaction.commandName === "source-code") {
       const isEphemeral = interaction.options.getBoolean("ephemeral") ?? true; // Default to true if not specified
       await interaction.reply(ephemeralReply("The source code for this bot can be found [here](<https://github.com/giralal/Reaction-Cleaner-Bot>)", isEphemeral));
